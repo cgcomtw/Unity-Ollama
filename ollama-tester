@@ -1,0 +1,186 @@
+using System.Collections;
+using System.Diagnostics;
+using System.Text;
+using UnityEngine;
+using UnityEngine.Networking;
+using UnityEngine.UI;
+
+public class OllamaLatencyTester : MonoBehaviour
+{
+    [Header("UI 參考")]
+    public InputField ipInputField;        // IP 輸入欄位
+    public InputField portInputField;      // Port 輸入欄位（預設 11343）
+    public InputField questionInputField;  // 問題輸入欄位
+    public Text answerText;               // 顯示回應的文字
+    public Button sendButton;             // 送出按鈕
+
+    [Header("Ollama 設定")]
+    public string defaultIP = "127.0.0.1"; // 預設 IP
+    public string defaultModel = "llama3"; // 預設模型名稱，可在 Inspector 改
+
+    private const string DefaultPort = "11343"; // 你指定的預設 Port
+
+    private void Start()
+    {
+        // 預設 IP / Port
+        if (ipInputField && string.IsNullOrEmpty(ipInputField.text))
+            ipInputField.text = defaultIP;
+
+        if (portInputField && string.IsNullOrEmpty(portInputField.text))
+            portInputField.text = DefaultPort;
+
+        if (sendButton != null)
+            sendButton.onClick.AddListener(OnClickSend);
+    }
+
+    private void OnDestroy()
+    {
+        if (sendButton != null)
+            sendButton.onClick.RemoveListener(OnClickSend);
+    }
+
+    /// <summary>
+    /// 按下送出按鈕時呼叫
+    /// </summary>
+    public void OnClickSend()
+    {
+        string ip = ipInputField ? ipInputField.text.Trim() : defaultIP;
+        string port = portInputField ? portInputField.text.Trim() : DefaultPort;
+        string question = questionInputField ? questionInputField.text.Trim() : "";
+
+        if (string.IsNullOrEmpty(question))
+        {
+            if (answerText) answerText.text = "請先輸入問題。";
+            return;
+        }
+
+        if (string.IsNullOrEmpty(ip))
+            ip = defaultIP;
+
+        if (string.IsNullOrEmpty(port))
+            port = DefaultPort;
+
+        string url = $"http://{ip}:{port}/api/chat";
+
+        if (answerText)
+            answerText.text = $"目標伺服器：{url}\n送出請求中，請稍候…";
+
+        StartCoroutine(SendOllamaRequest(url, question));
+    }
+
+    /// <summary>
+    /// 實際送出 HTTP POST 給 Ollama，並量測時間
+    /// </summary>
+    private IEnumerator SendOllamaRequest(string url, string question)
+    {
+        var stopwatch = new Stopwatch();
+        stopwatch.Start();
+
+        // 組出 /api/chat 的 request JSON
+        ChatRequest requestData = new ChatRequest
+        {
+            model = string.IsNullOrEmpty(defaultModel) ? "llama3" : defaultModel,
+            stream = false,
+            messages = new[]
+            {
+                new ChatMessage
+                {
+                    role = "user",
+                    content = question
+                }
+            }
+        };
+
+        string json = JsonUtility.ToJson(requestData);
+        byte[] bodyRaw = Encoding.UTF8.GetBytes(json);
+
+        using (UnityWebRequest www = new UnityWebRequest(url, "POST"))
+        {
+            www.uploadHandler = new UploadHandlerRaw(bodyRaw);
+            www.downloadHandler = new DownloadHandlerBuffer();
+            www.SetRequestHeader("Content-Type", "application/json");
+
+            yield return www.SendWebRequest();
+
+            stopwatch.Stop();
+            double seconds = stopwatch.Elapsed.TotalSeconds;
+
+#if UNITY_2020_1_OR_NEWER
+            bool isError = www.result != UnityWebRequest.Result.Success;
+#else
+            bool isError = www.isNetworkError || www.isHttpError;
+#endif
+
+            if (isError)
+            {
+                if (answerText)
+                    answerText.text = $"連線失敗：{www.error}\n\n耗時：{seconds:F2} 秒";
+            }
+            else
+            {
+                string responseText = www.downloadHandler.text;
+                string answer = "";
+
+                // 優先嘗試解析為 /api/chat 回傳格式
+                try
+                {
+                    ChatResponse resp = JsonUtility.FromJson<ChatResponse>(responseText);
+                    if (resp != null && resp.message != null && !string.IsNullOrEmpty(resp.message.content))
+                    {
+                        answer = resp.message.content;
+                    }
+                    else
+                    {
+                        // 如果解析不到 message，就直接顯示原始 JSON
+                        answer = responseText;
+                    }
+                }
+                catch
+                {
+                    // 解析失敗就直接顯示原始文字
+                    answer = responseText;
+                }
+
+                if (answerText)
+                {
+                    answerText.text =
+                        answer +
+                        $"\n\n---\n處理時間：{seconds:F2} 秒";
+                }
+            }
+        }
+    }
+
+    #region JSON 資料結構
+
+    [System.Serializable]
+    public class ChatRequest
+    {
+        public string model;
+        public bool stream;
+        public ChatMessage[] messages;
+    }
+
+    [System.Serializable]
+    public class ChatMessage
+    {
+        public string role;
+        public string content;
+    }
+
+    // /api/chat 的標準回傳格式（簡化版）
+    // {
+    //   "model": "...",
+    //   "created_at": "...",
+    //   "message": { "role": "assistant", "content": "..." },
+    //   "done": true,
+    //   ...
+    // }
+    [System.Serializable]
+    public class ChatResponse
+    {
+        public ChatMessage message;
+    }
+
+    #endregion
+}
