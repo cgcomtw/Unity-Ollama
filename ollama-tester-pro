@@ -1,0 +1,261 @@
+using System.Collections;
+using System.Diagnostics;
+using System.Text;
+using UnityEngine;
+using UnityEngine.Networking;
+using UnityEngine.UI;
+
+/// <summary>
+/// 同一個問題同時送到 3 台 Ollama 伺服器進行測試，
+/// 並顯示各自的回答與耗時。
+/// </summary>
+public class OllamaMultiServerTester : MonoBehaviour
+{
+    [System.Serializable]
+    public class ServerUISet
+    {
+        public string serverName = "Server"; // 只是用來顯示用
+        public InputField ipInputField;
+        public InputField portInputField;
+        public Text resultText;
+    }
+
+    [Header("三台伺服器 UI 設定")]
+    public ServerUISet[] servers = new ServerUISet[3];
+
+    [Header("共用 UI")]
+    public InputField questionInputField;
+    public Dropdown modelDropdown;
+    public Button sendButton;
+
+    [Header("預設值 / 模型清單")]
+    public string defaultIP = "127.0.0.1";
+    public string defaultPort = "11343";
+
+    // 你可以在 Inspector 或程式碼中修改這個陣列的內容
+    public string[] availableModels = new string[]
+    {
+        "llama3",
+        "llama3:8b",
+        "gemma3:1b",
+        "qwen2:1.5b"
+    };
+
+    private void Start()
+    {
+        // 初始化 Server 預設 IP / Port / 顯示
+        for (int i = 0; i < servers.Length; i++)
+        {
+            var s = servers[i];
+            if (s == null) continue;
+
+            if (s.ipInputField && string.IsNullOrEmpty(s.ipInputField.text))
+                s.ipInputField.text = defaultIP;
+
+            if (s.portInputField && string.IsNullOrEmpty(s.portInputField.text))
+                s.portInputField.text = defaultPort;
+
+            if (s.resultText)
+                s.resultText.text = $"{(string.IsNullOrEmpty(s.serverName) ? $"Server {i + 1}" : s.serverName)} 等待測試...";
+        }
+
+        // 初始化模型下拉選單
+        if (modelDropdown)
+        {
+            modelDropdown.ClearOptions();
+            var options = new System.Collections.Generic.List<Dropdown.OptionData>();
+            foreach (var m in availableModels)
+            {
+                options.Add(new Dropdown.OptionData(m));
+            }
+            modelDropdown.AddOptions(options);
+            if (availableModels.Length > 0)
+                modelDropdown.value = 0;
+        }
+
+        if (sendButton)
+            sendButton.onClick.AddListener(OnClickSend);
+    }
+
+    private void OnDestroy()
+    {
+        if (sendButton)
+            sendButton.onClick.RemoveListener(OnClickSend);
+    }
+
+    /// <summary>
+    /// 點擊送出按鈕：同一個問題 + 模型送到 3 台伺服器
+    /// </summary>
+    public void OnClickSend()
+    {
+        string question = questionInputField ? questionInputField.text.Trim() : "";
+        if (string.IsNullOrEmpty(question))
+        {
+            // 如果沒輸入問題，就在第一台結果區顯示提示
+            if (servers != null && servers.Length > 0 && servers[0] != null && servers[0].resultText)
+                servers[0].resultText.text = "請先輸入問題再測試。";
+            return;
+        }
+
+        string model = GetSelectedModel();
+
+        // 每台伺服器各自送出請求
+        for (int i = 0; i < servers.Length; i++)
+        {
+            var s = servers[i];
+            if (s == null) continue;
+
+            string ip = s.ipInputField ? s.ipInputField.text.Trim() : defaultIP;
+            string port = s.portInputField ? s.portInputField.text.Trim() : defaultPort;
+
+            if (string.IsNullOrEmpty(ip)) ip = defaultIP;
+            if (string.IsNullOrEmpty(port)) port = defaultPort;
+
+            string url = $"http://{ip}:{port}/api/chat";
+
+            if (s.resultText)
+            {
+                string serverName = string.IsNullOrEmpty(s.serverName) ? $"Server {i + 1}" : s.serverName;
+                s.resultText.text = $"{serverName}\n目標：{url}\n模型：{model}\n送出請求中...";
+            }
+
+            StartCoroutine(SendOllamaRequestCoroutine(i, url, question, model));
+        }
+    }
+
+    private string GetSelectedModel()
+    {
+        if (availableModels == null || availableModels.Length == 0)
+            return "llama3";
+
+        if (!modelDropdown)
+            return availableModels[0];
+
+        int index = Mathf.Clamp(modelDropdown.value, 0, availableModels.Length - 1);
+        return availableModels[index];
+    }
+
+    /// <summary>
+    /// 對單一伺服器送 /api/chat，並顯示結果與耗時
+    /// </summary>
+    private IEnumerator SendOllamaRequestCoroutine(int serverIndex, string url, string question, string model)
+    {
+        if (serverIndex < 0 || serverIndex >= servers.Length)
+            yield break;
+
+        var s = servers[serverIndex];
+        if (s == null) yield break;
+
+        var stopwatch = new Stopwatch();
+        stopwatch.Start();
+
+        ChatRequest requestData = new ChatRequest
+        {
+            model = model,
+            stream = false,
+            messages = new[]
+            {
+                new ChatMessage
+                {
+                    role = "user",
+                    content = question
+                }
+            }
+        };
+
+        string json = JsonUtility.ToJson(requestData);
+        byte[] bodyRaw = Encoding.UTF8.GetBytes(json);
+
+        using (UnityWebRequest www = new UnityWebRequest(url, "POST"))
+        {
+            www.uploadHandler = new UploadHandlerRaw(bodyRaw);
+            www.downloadHandler = new DownloadHandlerBuffer();
+            www.SetRequestHeader("Content-Type", "application/json");
+
+            yield return www.SendWebRequest();
+
+            stopwatch.Stop();
+            double seconds = stopwatch.Elapsed.TotalSeconds;
+
+#if UNITY_2020_1_OR_NEWER
+            bool isError = www.result != UnityWebRequest.Result.Success;
+#else
+            bool isError = www.isNetworkError || www.isHttpError;
+#endif
+
+            string serverName = string.IsNullOrEmpty(s.serverName) ? $"Server {serverIndex + 1}" : s.serverName;
+
+            if (isError)
+            {
+                if (s.resultText)
+                {
+                    s.resultText.text =
+                        $"{serverName}\n" +
+                        $"URL：{url}\n" +
+                        $"模型：{model}\n" +
+                        $"連線失敗：{www.error}\n\n" +
+                        $"耗時：{seconds:F2} 秒";
+                }
+            }
+            else
+            {
+                string responseText = www.downloadHandler.text;
+                string answer = "";
+
+                // 嘗試解析 /api/chat 格式
+                try
+                {
+                    ChatResponse resp = JsonUtility.FromJson<ChatResponse>(responseText);
+                    if (resp != null && resp.message != null && !string.IsNullOrEmpty(resp.message.content))
+                    {
+                        answer = resp.message.content;
+                    }
+                    else
+                    {
+                        answer = responseText;
+                    }
+                }
+                catch
+                {
+                    // JSON 解析失敗就直接顯示原始內容
+                    answer = responseText;
+                }
+
+                if (s.resultText)
+                {
+                    s.resultText.text =
+                        $"{serverName}\n" +
+                        $"URL：{url}\n" +
+                        $"模型：{model}\n\n" +
+                        answer +
+                        $"\n\n---\n處理時間：{seconds:F2} 秒";
+                }
+            }
+        }
+    }
+
+    #region Ollama JSON 結構
+
+    [System.Serializable]
+    public class ChatRequest
+    {
+        public string model;
+        public bool stream;
+        public ChatMessage[] messages;
+    }
+
+    [System.Serializable]
+    public class ChatMessage
+    {
+        public string role;
+        public string content;
+    }
+
+    [System.Serializable]
+    public class ChatResponse
+    {
+        public ChatMessage message;
+    }
+
+    #endregion
+}
