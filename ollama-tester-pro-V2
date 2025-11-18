@@ -1,0 +1,395 @@
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Text;
+using System.IO;
+using System.Globalization;
+using UnityEngine;
+using UnityEngine.Networking;
+using UnityEngine.UI;
+
+/// <summary>
+/// Pro 版：
+/// - 同一個問題 + 模型，送到最多 3 台 Ollama 伺服器
+/// - 每台伺服器可重複測試多次，計算平均 / 最快 / 最慢
+/// - 可選擇將結果輸出為 CSV 檔案
+/// </summary>
+public class OllamaMultiServerTester : MonoBehaviour
+{
+    [System.Serializable]
+    public class ServerUISet
+    {
+        public string serverName = "Server"; // 只是顯示用
+        public InputField ipInputField;
+        public InputField portInputField;
+        public Text resultText;
+    }
+
+    [Header("三台伺服器 UI 設定")]
+    public ServerUISet[] servers = new ServerUISet[3];
+
+    [Header("共用 UI")]
+    public InputField questionInputField;
+    public Dropdown modelDropdown;
+    public Button sendButton;
+
+    [Header("預設值")]
+    public string defaultIP = "127.0.0.1";
+    public string defaultPort = "11343";
+
+    [Header("效能測試設定")]
+    [Tooltip("同一台伺服器要重複測試幾次。")]
+    public int repeatCount = 3;
+
+    [Tooltip("是否將每一次測試結果輸出為 CSV。")]
+    public bool exportToCsv = true;
+
+    [Tooltip("CSV 檔案名稱，會存放在 Application.persistentDataPath 底下。")]
+    public string csvFileName = "ollama_benchmark.csv";
+
+    [Header("可選擇的模型清單（會出現在 Dropdown）")]
+    public string[] availableModels = new string[]
+    {
+        "llama3",
+        "llama3:8b",
+        "gemma3:1b",
+        "qwen2:1.5b"
+    };
+
+    private void Start()
+    {
+        // 初始化 Server 預設 IP / Port / 顯示
+        for (int i = 0; i < servers.Length; i++)
+        {
+            var s = servers[i];
+            if (s == null) continue;
+
+            if (s.ipInputField && string.IsNullOrEmpty(s.ipInputField.text))
+                s.ipInputField.text = defaultIP;
+
+            if (s.portInputField && string.IsNullOrEmpty(s.portInputField.text))
+                s.portInputField.text = defaultPort;
+
+            if (s.resultText)
+                s.resultText.text = $"{GetServerName(i)} 等待測試...";
+        }
+
+        // 初始化模型下拉選單
+        if (modelDropdown)
+        {
+            modelDropdown.ClearOptions();
+            var options = new List<Dropdown.OptionData>();
+            foreach (var m in availableModels)
+            {
+                options.Add(new Dropdown.OptionData(m));
+            }
+            modelDropdown.AddOptions(options);
+
+            if (availableModels.Length > 0)
+                modelDropdown.value = 0;
+        }
+
+        if (sendButton)
+            sendButton.onClick.AddListener(OnClickSend);
+    }
+
+    private void OnDestroy()
+    {
+        if (sendButton)
+            sendButton.onClick.RemoveListener(OnClickSend);
+    }
+
+    /// <summary>
+    /// 點擊「送出」：同一個問題 + 模型，對每台伺服器跑效能測試
+    /// </summary>
+    public void OnClickSend()
+    {
+        string question = questionInputField ? questionInputField.text.Trim() : "";
+        if (string.IsNullOrEmpty(question))
+        {
+            if (servers != null && servers.Length > 0 && servers[0] != null && servers[0].resultText)
+                servers[0].resultText.text = "請先輸入問題再測試。";
+            return;
+        }
+
+        if (repeatCount <= 0)
+            repeatCount = 1;
+
+        string model = GetSelectedModel();
+
+        // 每台伺服器各自跑 benchmark（使用 Coroutine 平行進行）
+        for (int i = 0; i < servers.Length; i++)
+        {
+            var s = servers[i];
+            if (s == null) continue;
+
+            string ip = s.ipInputField ? s.ipInputField.text.Trim() : defaultIP;
+            string port = s.portInputField ? s.portInputField.text.Trim() : defaultPort;
+
+            if (string.IsNullOrEmpty(ip)) ip = defaultIP;
+            if (string.IsNullOrEmpty(port)) port = defaultPort;
+
+            string url = $"http://{ip}:{port}/api/chat";
+
+            if (s.resultText)
+            {
+                s.resultText.text =
+                    $"{GetServerName(i)}\n" +
+                    $"URL：{url}\n" +
+                    $"模型：{model}\n" +
+                    $"準備進行 {repeatCount} 次測試...";
+            }
+
+            StartCoroutine(RunServerBenchmarkCoroutine(i, url, question, model));
+        }
+    }
+
+    private string GetServerName(int index)
+    {
+        if (index < 0 || index >= servers.Length || servers[index] == null)
+            return $"Server {index + 1}";
+
+        var s = servers[index];
+        return string.IsNullOrEmpty(s.serverName) ? $"Server {index + 1}" : s.serverName;
+    }
+
+    private string GetSelectedModel()
+    {
+        if (availableModels == null || availableModels.Length == 0)
+            return "llama3";
+
+        if (!modelDropdown)
+            return availableModels[0];
+
+        int index = Mathf.Clamp(modelDropdown.value, 0, availableModels.Length - 1);
+        return availableModels[index];
+    }
+
+    /// <summary>
+    /// 對單一伺服器進行多次效能測試，並顯示統計結果。
+    /// </summary>
+    private IEnumerator RunServerBenchmarkCoroutine(int serverIndex, string url, string question, string model)
+    {
+        if (serverIndex < 0 || serverIndex >= servers.Length)
+            yield break;
+
+        var s = servers[serverIndex];
+        if (s == null) yield break;
+
+        var durations = new List<double>();
+        string lastAnswer = "";
+        string serverName = GetServerName(serverIndex);
+
+        for (int run = 1; run <= repeatCount; run++)
+        {
+            if (s.resultText)
+            {
+                s.resultText.text =
+                    $"{serverName}\n" +
+                    $"URL：{url}\n" +
+                    $"模型：{model}\n" +
+                    $"測試進行中：{run}/{repeatCount} ...";
+            }
+
+            var stopwatch = new Stopwatch();
+            stopwatch.Start();
+
+            ChatRequest requestData = new ChatRequest
+            {
+                model = model,
+                stream = false,
+                messages = new[]
+                {
+                    new ChatMessage
+                    {
+                        role = "user",
+                        content = question
+                    }
+                }
+            };
+
+            string json = JsonUtility.ToJson(requestData);
+            byte[] bodyRaw = Encoding.UTF8.GetBytes(json);
+
+            using (UnityWebRequest www = new UnityWebRequest(url, "POST"))
+            {
+                www.uploadHandler = new UploadHandlerRaw(bodyRaw);
+                www.downloadHandler = new DownloadHandlerBuffer();
+                www.SetRequestHeader("Content-Type", "application/json");
+
+                yield return www.SendWebRequest();
+
+                stopwatch.Stop();
+                double seconds = stopwatch.Elapsed.TotalSeconds;
+                durations.Add(seconds);
+
+#if UNITY_2020_1_OR_NEWER
+                bool isError = www.result != UnityWebRequest.Result.Success;
+#else
+                bool isError = www.isNetworkError || www.isHttpError;
+#endif
+
+                if (isError)
+                {
+                    lastAnswer =
+                        $"連線失敗：{www.error}\n" +
+                        $"（第 {run} 次，耗時 {seconds:F2} 秒）";
+
+                    // 如果失敗就不用繼續測這一台，直接跳出
+                    break;
+                }
+                else
+                {
+                    string responseText = www.downloadHandler.text;
+                    string answer = "";
+
+                    // 嘗試解析 /api/chat 格式
+                    try
+                    {
+                        ChatResponse resp = JsonUtility.FromJson<ChatResponse>(responseText);
+                        if (resp != null && resp.message != null && !string.IsNullOrEmpty(resp.message.content))
+                        {
+                            answer = resp.message.content;
+                        }
+                        else
+                        {
+                            answer = responseText;
+                        }
+                    }
+                    catch
+                    {
+                        // JSON 解析失敗就直接顯示原始內容
+                        answer = responseText;
+                    }
+
+                    lastAnswer = answer;
+                }
+            }
+        }
+
+        // 計算統計資料
+        string statsText;
+
+        if (durations.Count == 0)
+        {
+            statsText = "無可用測試結果（可能全部連線失敗）。";
+        }
+        else
+        {
+            double sum = 0;
+            double min = double.MaxValue;
+            double max = double.MinValue;
+
+            foreach (var d in durations)
+            {
+                sum += d;
+                if (d < min) min = d;
+                if (d > max) max = d;
+            }
+
+            double avg = sum / durations.Count;
+
+            statsText =
+                $"測試次數：{durations.Count}\n" +
+                $"平均時間：{avg:F2} 秒\n" +
+                $"最快時間：{min:F2} 秒\n" +
+                $"最慢時間：{max:F2} 秒\n" +
+                $"個別結果（秒）：{string.Join(", ", durations.ConvertAll(d => d.ToString("F2")))}";
+        }
+
+        // 更新畫面顯示
+        if (s.resultText)
+        {
+            s.resultText.text =
+                $"{serverName}\n" +
+                $"URL：{url}\n" +
+                $"模型：{model}\n\n" +
+                $"【最後一次回答】\n" +
+                $"{lastAnswer}\n\n" +
+                "【效能統計】\n" +
+                $"{statsText}";
+        }
+
+        // 輸出 CSV
+        if (exportToCsv && durations.Count > 0)
+        {
+            AppendResultsToCsv(serverName, url, model, durations);
+        }
+    }
+
+    #region CSV 輸出相關
+
+    private void AppendResultsToCsv(string serverName, string url, string model, List<double> durations)
+    {
+        string path = Path.Combine(Application.persistentDataPath, csvFileName);
+
+        var sb = new StringBuilder();
+
+        // 如果檔案不存在，就先寫入標題列
+        if (!File.Exists(path))
+        {
+            sb.AppendLine("timestamp,server,model,url,runIndex,durationSeconds");
+        }
+
+        string timestamp = System.DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+
+        for (int i = 0; i < durations.Count; i++)
+        {
+            string line =
+                EscapeCsv(timestamp) + "," +
+                EscapeCsv(serverName) + "," +
+                EscapeCsv(model) + "," +
+                EscapeCsv(url) + "," +
+                (i + 1).ToString() + "," +
+                durations[i].ToString("F4", CultureInfo.InvariantCulture);
+
+            sb.AppendLine(line);
+        }
+
+        File.AppendAllText(path, sb.ToString(), Encoding.UTF8);
+
+        UnityEngine.Debug.Log($"[OllamaMultiServerTester] CSV 已寫入：{path}");
+    }
+
+    private string EscapeCsv(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return "";
+
+        bool mustQuote = value.Contains(",") || value.Contains("\"") || value.Contains("\n");
+        if (mustQuote)
+        {
+            value = value.Replace("\"", "\"\"");
+            return $"\"{value}\"";
+        }
+        return value;
+    }
+
+    #endregion
+
+    #region Ollama JSON 結構
+
+    [System.Serializable]
+    public class ChatRequest
+    {
+        public string model;
+        public bool stream;
+        public ChatMessage[] messages;
+    }
+
+    [System.Serializable]
+    public class ChatMessage
+    {
+        public string role;
+        public string content;
+    }
+
+    [System.Serializable]
+    public class ChatResponse
+    {
+        public ChatMessage message;
+    }
+
+    #endregion
+}
+
